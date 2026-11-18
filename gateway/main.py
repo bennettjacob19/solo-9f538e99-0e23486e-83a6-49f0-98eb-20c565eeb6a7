@@ -7,7 +7,11 @@
 - 客户端超时/断连不等于上游结束：上游任务被 shield 保护，计数只在上游
   请求真正结束时扣减；
 - 宣告完成前新副本失效 -> 自动回滚，旧副本重新接单；
-- 计数恰好一次：受理时在锁内 +1，每个上游任务的 done 回调里 -1（恰好一次）。
+- 计数恰好一次：受理时在锁内 +1，每个上游任务的 done 回调里 -1（恰好一次）；
+- 防过期探活竞态：每次健康观测带采集时间戳，锁内只采纳更新的观测
+  （较早的“健康”不得覆盖较新的“失效”）；健康控制接口成功即被采纳为权威
+  观测；宣告完成要求本次探活晚于最近一次确认的失效，否则拒绝，恢复
+  健康后须重新宣告（重新探活确认）才能定案。
 """
 from __future__ import annotations
 
@@ -54,7 +58,9 @@ class CutoverState:
         self.active = "old"                # 当前活动副本：old | new
         self.declared_complete = False     # 是否已宣告完成（宣告后不再回滚）
         self.in_flight = {"old": 0, "new": 0}
-        self.health = {"old": None, "new": None}   # None=未知
+        self.health = {"old": None, "new": None}        # 最新已采纳的健康观测；None=未知
+        self.health_ts = {"old": 0.0, "new": 0.0}       # 最新观测的采集时刻（monotonic）
+        self.last_unhealthy_ts = {"old": 0.0, "new": 0.0}  # 最近一次“失效”观测的采集时刻
         self.admitted = {"old": 0, "new": 0}
         self.completed = {"old": 0, "new": 0}
         self.failed = {"old": 0, "new": 0}
@@ -75,12 +81,43 @@ def log_event(msg: str) -> None:
     log.info(msg)
 
 
-async def check_health(name: str) -> bool:
+async def check_health(name: str) -> tuple[bool, float]:
+    """实时探活，返回 (是否健康, 观测采集时刻)。
+
+    采集时刻（monotonic）用于给并发/交错的探活结果排序：只有更新的观测
+    才允许覆盖已采纳的状态，防止“较早读到的健康”覆盖“较晚确认的失效”。
+    """
     try:
         r = await client.get(REPLICAS[name] + "/healthz", timeout=2.0)
-        return r.status_code == 200
+        return r.status_code == 200, time.monotonic()
     except Exception:
+        return False, time.monotonic()
+
+
+def apply_health_observation(name: str, ok: bool, obs_ts: float, source: str) -> bool:
+    """在 state.lock 内应用一次健康观测；返回是否被采纳。
+
+    - 过期观测（采集时刻早于已采纳的最新观测）直接丢弃：较早的“健康”
+      不得覆盖较新的“失效”，反之亦然；
+    - 采纳“失效”时记录 last_unhealthy_ts，并在“未宣告完成且活动副本为 new”
+      时立即自动回滚——健康控制与周期探测共用同一入口，语义一致。
+    """
+    if obs_ts < state.health_ts[name]:
+        log_event(f"丢弃过期探活：{source} 对 {name} 的观测（{'健康' if ok else '失效'}）"
+                  f"早于已采纳的最新状态，不予覆盖")
         return False
+    prev = state.health[name]
+    state.health[name] = ok
+    state.health_ts[name] = obs_ts
+    if not ok:
+        state.last_unhealthy_ts[name] = obs_ts
+    if prev != ok:
+        log_event(f"副本 {name} 健康状态 -> {'健康' if ok else '失效'}（{source}）")
+    if name == "new" and not ok and state.active == "new" and not state.declared_complete:
+        state.active = "old"
+        state.generation += 1
+        log_event("自动回滚：新副本在宣告完成前失效，流量切回旧副本，旧副本重新接单")
+    return True
 
 
 async def health_poller() -> None:
@@ -89,15 +126,8 @@ async def health_poller() -> None:
     while True:
         results = {name: await check_health(name) for name in ("old", "new")}
         async with state.lock:
-            for name, ok in results.items():
-                prev = state.health[name]
-                state.health[name] = ok
-                if prev != ok:
-                    log_event(f"副本 {name} 健康状态 -> {'健康' if ok else '失效'}")
-            if state.active == "new" and not state.declared_complete and results["new"] is False:
-                state.active = "old"
-                state.generation += 1
-                log_event("自动回滚：新副本在宣告完成前失效，流量切回旧副本，旧副本重新接单")
+            for name, (ok, obs_ts) in results.items():
+                apply_health_observation(name, ok, obs_ts, "周期探测")
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -191,11 +221,16 @@ async def proxy(path: str, request: Request):
 
 @app.post("/ops/switch")
 async def switch_to_new():
-    """发起切换。新副本未就绪 -> 拒绝，旧副本继续接单。"""
-    ok = await check_health("new")   # 切换前实时探活，不依赖周期任务
+    """发起切换。新副本未就绪 -> 拒绝，旧副本继续接单。
+
+    探活在锁外进行，结果按采集时刻与已采纳状态排序：若探活期间健康控制
+    或周期探测已确认了更新的失效，本次较旧的“健康”不会覆盖它，切换按
+    最新已知状态裁决。
+    """
+    ok, obs_ts = await check_health("new")   # 切换前实时探活，不依赖周期任务
     async with state.lock:
-        state.health["new"] = ok
-        if not ok:
+        apply_health_observation("new", ok, obs_ts, "切换前探活")
+        if state.health["new"] is not True:
             log_event("切换被拒绝：新副本未就绪，旧副本继续接单")
             return JSONResponse({"ok": False, "reason": "新副本未就绪，已拒绝切换，旧副本继续接单"}, status_code=409)
         if state.active == "new":
@@ -224,17 +259,28 @@ async def rollback_manual():
 
 @app.post("/ops/declare-complete")
 async def declare_complete():
-    """宣告完成：此后禁用回滚。旧副本可停机仍需等在途清零。"""
-    ok = await check_health("new")
+    """宣告完成：此后禁用回滚。旧副本可停机仍需等在途清零。
+
+    防过期探活竞态：宣告所依据的探活必须“新鲜”——若健康控制或周期探测
+    已确认了更新的失效（last_unhealthy_ts 晚于本次探活采集时刻），说明
+    本次探活结果已过期，宣告必须拒绝；即使随后恢复健康，也必须重新发起
+    宣告（重新探活确认）才能定案。由此保留回滚能力与旧副本停机禁令。
+    """
+    ok, obs_ts = await check_health("new")
     async with state.lock:
-        state.health["new"] = ok
+        apply_health_observation("new", ok, obs_ts, "宣告前探活")
         if state.active != "new":
             return JSONResponse({"ok": False, "reason": "尚未切换到新副本"}, status_code=409)
-        if not ok:
-            log_event("宣告完成被拒绝：新副本当前失效")
-            return JSONResponse({"ok": False, "reason": "新副本当前失效，不能宣告完成"}, status_code=409)
         if state.declared_complete:
             return {"ok": True, "msg": "已宣告过完成"}
+        if not ok or state.health["new"] is not True:
+            log_event("宣告完成被拒绝：新副本当前失效")
+            return JSONResponse({"ok": False, "reason": "新副本当前失效，不能宣告完成"}, status_code=409)
+        if state.last_unhealthy_ts["new"] > obs_ts:
+            log_event("宣告完成被拒绝：本次探活早于已确认的失效（结果已过期），须重新探活确认")
+            return JSONResponse(
+                {"ok": False, "reason": "探活结果已过期：新副本曾被确认失效，恢复健康后须重新宣告以重新探活确认"},
+                status_code=409)
         state.declared_complete = True
         log_event("宣告完成：切换定案，回滚禁用；旧副本在途清零后即可停机")
         return {"ok": True, "msg": "已宣告完成"}
@@ -285,9 +331,15 @@ async def set_replica_health(name: str, healthy: bool):
         return JSONResponse({"ok": False, "reason": "unknown replica"}, status_code=404)
     try:
         r = await client.post(f"{REPLICAS[name]}/control/health?healthy={str(healthy).lower()}", timeout=3.0)
-        return JSONResponse(r.json(), status_code=r.status_code)
+        obs_ts = time.monotonic()
     except Exception as exc:
         return JSONResponse({"ok": False, "reason": f"replica unreachable: {exc}"}, status_code=502)
+    if r.status_code == 200:
+        # 健康控制成功即一次权威观测：立即采纳（不必等周期探测下个周期）。
+        # 确认失效会立刻触发自动回滚判断，并使尚在途中的过期宣告被拒绝。
+        async with state.lock:
+            apply_health_observation(name, healthy, obs_ts, "健康控制")
+    return JSONResponse(r.json(), status_code=r.status_code)
 
 
 @app.post("/ops/replica/{name}/delay")

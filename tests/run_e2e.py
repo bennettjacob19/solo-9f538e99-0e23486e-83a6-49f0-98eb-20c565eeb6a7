@@ -291,13 +291,24 @@ async def s9_declare_gating(c):
     assert s["declared_complete"] is True and s["safe_to_stop_old"] is True
 
 
-async def s10_handler_cancelled_midflight(c):
-    """S10 处理器协程被取消（某些服务器在客户端断连时的行为）：
-    shield 保护的上游任务必须继续到真正结束，计数只在那时扣减。"""
+def load_gw():
+    """在测试进程内加载网关模块，直接驱动其处理器（不经 HTTP 网关进程）。"""
     os.environ["OLD_URL"] = OLD
     os.environ["NEW_URL"] = NEW
     sys.path.insert(0, os.path.join(ROOT, "gateway"))
-    import main as gw          # 在测试进程内加载网关模块，直接驱动其处理器
+    import main as gw
+    return gw
+
+
+def code_of(resp):
+    """网关处理器返回 dict（200）或 JSONResponse；统一取状态码。"""
+    return getattr(resp, "status_code", 200)
+
+
+async def s10_handler_cancelled_midflight(c):
+    """S10 处理器协程被取消（某些服务器在客户端断连时的行为）：
+    shield 保护的上游任务必须继续到真正结束，计数只在那时扣减。"""
+    gw = load_gw()
     from starlette.requests import Request
     gw.client = httpx.AsyncClient()
 
@@ -333,6 +344,196 @@ async def s10_handler_cancelled_midflight(c):
     await gw.client.aclose()
 
 
+async def s11_stale_probe_declare_rejected(c):
+    """S11 过期探活竞态：宣告的探活先读到健康，随后健康控制确认失效并成功，
+    该过期宣告必须被拒绝（不定案、保留回滚与停机禁令）；较早的健康不得覆盖
+    较新的失效；恢复健康后须重新宣告（重新探活确认）才能定案。"""
+    gw = load_gw()
+    gw.client = httpx.AsyncClient()
+    orig_check = gw.check_health
+    try:
+        r = await gw.reset_demo()
+        assert code_of(r) == 200, "复位应成功（S10 的在途已排水）"
+        await gw.set_replica_health("new", healthy=True)
+        assert gw.state.health["new"] is True, "健康控制成功应立即被采纳为最新观测"
+        r = await gw.switch_to_new()
+        assert code_of(r) == 200 and gw.state.active == "new"
+
+        def hold_next_probe():
+            """武装一次性探活挂起：下一次对 new 的探活拿到结果后被扣住，
+            直到 release 事件——确定性放大“探活已完成、宣告未定案”的竞态窗口。"""
+            probe_done, release = asyncio.Event(), asyncio.Event()
+            armed = {"on": True}
+
+            async def held(name):
+                res = await orig_check(name)      # 真实探活，采集时刻诚实
+                if name == "new" and armed["on"]:
+                    armed["on"] = False
+                    probe_done.set()
+                    await release.wait()
+                return res
+            return held, probe_done, release
+
+        # —— 阶段1：探活读到健康 → 健康控制确认失效 → 过期宣告到达 ——
+        held, probe_done, release = hold_next_probe()
+        gw.check_health = held
+        decl = asyncio.create_task(gw.declare_complete())
+        await asyncio.wait_for(probe_done.wait(), 5)          # 宣告的探活已读到“健康”
+        r = await gw.set_replica_health("new", healthy=False)  # 网页随后设失效并成功
+        assert code_of(r) == 200
+        assert gw.state.health["new"] is False, "健康控制确认的失效应立即生效"
+        assert gw.state.active == "old", "确认失效应立即自动回滚（不必等周期探测）"
+
+        # 周期探测若带回更早时刻的“健康”，也不得覆盖已确认的失效
+        async with gw.state.lock:
+            stale_ts = gw.state.health_ts["new"] - 1.0
+            applied = gw.apply_health_observation("new", True, stale_ts, "周期探测")
+        assert applied is False and gw.state.health["new"] is False, \
+            "较早的健康结果不得覆盖较新的失效"
+
+        release.set()
+        r = await decl                                        # 过期宣告到达
+        assert code_of(r) == 409, f"过期宣告必须被拒绝: {r}"
+        assert gw.state.declared_complete is False, "过期宣告不得定案"
+        s = await gw.get_status()
+        assert s["safe_to_stop_old"] is False, "未宣告完成，状态页不得提示旧副本可停机"
+
+        # —— 阶段2：恢复并重新切换后，探活早于失效的过期宣告仍须拒绝 ——
+        await gw.set_replica_health("new", healthy=True)
+        r = await gw.switch_to_new()
+        assert code_of(r) == 200 and gw.state.active == "new"
+
+        held, probe_done, release = hold_next_probe()
+        gw.check_health = held
+        decl = asyncio.create_task(gw.declare_complete())
+        await asyncio.wait_for(probe_done.wait(), 5)          # 探活读到健康（失效之前）
+        await gw.set_replica_health("new", healthy=False)     # 失效 -> 立即自动回滚
+        assert gw.state.active == "old"
+        await gw.set_replica_health("new", healthy=True)      # 随后恢复健康
+        r = await gw.switch_to_new()                          # 重新切换（新鲜探活）
+        assert code_of(r) == 200 and gw.state.active == "new"
+        release.set()
+        r = await decl                                        # 过期宣告到达
+        assert code_of(r) == 409, "探活早于已确认的失效：即使当前健康也必须拒绝"
+        assert gw.state.declared_complete is False
+        assert gw.state.active == "new", "当前健康，不应回滚，回滚能力保留"
+        s = await gw.get_status()
+        assert s["safe_to_stop_old"] is False
+
+        # —— 阶段3：恢复健康后重新宣告（新鲜探活确认）-> 成功定案 ——
+        gw.check_health = orig_check
+        r = await gw.declare_complete()
+        assert code_of(r) == 200, f"重新宣告（重新探活确认）应成功: {r}"
+        assert gw.state.declared_complete is True
+    finally:
+        gw.check_health = orig_check
+        await gw.set_replica_health("new", healthy=True)
+        await gw.set_replica_health("old", healthy=True)
+        await gw.client.aclose()
+
+
+async def s12_chaos_declare_consistency(c):
+    """S12 并发请求 × 健康抖动 × 切换/回滚/宣告交错：
+    状态页结论一致（已宣告=>活动副本为 new、停机结论与宣告/在途一致、
+    宣告单调不回退），已有请求去向与计数不重不漏、恰好一次送达。"""
+    await reset_all(c)
+    base = await status(c)
+    base_recv = {
+        "old": (await c.get(OLD + "/state")).json()["received"],
+        "new": (await c.get(NEW + "/state")).json()["received"],
+    }
+    N, N2 = 36, 4
+    stop = asyncio.Event()
+    violations = []
+    declared_seen = False
+
+    async def flapper():
+        while not stop.is_set():
+            await c.post(GW + f"/ops/replica/new/health?healthy={random.choice(['true','false'])}")
+            await asyncio.sleep(random.uniform(0.1, 0.3))
+
+    OPS = ("/ops/switch", "/ops/declare-complete", "/ops/rollback")
+
+    async def operator():
+        i = 0
+        while not stop.is_set():
+            await c.post(GW + OPS[i % len(OPS)])   # 轮换三种操作，确保切换/宣告都被反复尝试
+            i += 1
+            await asyncio.sleep(random.uniform(0.12, 0.3))
+
+    async def sampler():
+        nonlocal declared_seen
+        while not stop.is_set():
+            s = await status(c)
+            for n in ("old", "new"):
+                if s["in_flight"][n] < 0:
+                    violations.append(f"{n} in_flight 为负: {s['in_flight'][n]}")
+                if s["admitted"][n] != s["completed"][n] + s["failed"][n] + s["in_flight"][n]:
+                    violations.append(f"{n} 计数不变式被破坏: {s}")
+            if s["declared_complete"]:
+                declared_seen = True
+                if s["active"] != "new":
+                    violations.append(f"已宣告完成但活动副本为 {s['active']}（页面自相矛盾）")
+            elif declared_seen:
+                violations.append("declared_complete 出现回退（应单调）")
+            if s["safe_to_stop_old"] != (s["declared_complete"] and s["in_flight"]["old"] == 0):
+                violations.append(f"停机结论与宣告/在途不一致: {s}")
+            await asyncio.sleep(0.07)
+
+    async def one_request(i):
+        await asyncio.sleep(random.uniform(0, 1.5))
+        r = await c.get(GW + f"/api/work?delay_ms={random.randint(30, 200)}")
+        return r.status_code
+
+    tasks_bg = [asyncio.create_task(f()) for f in (flapper, operator, sampler)]
+    codes = await asyncio.gather(*(one_request(i) for i in range(N)))
+    stop.set()
+    await asyncio.gather(*tasks_bg)
+
+    assert not violations, f"交错期间一致性被破坏: {violations[:3]}"
+    assert all(code == 200 for code in codes), f"所有请求应成功: {codes}"
+
+    # 定向收尾：必然覆盖“已宣告完成”状态——恢复健康、（如需）切换、宣告，
+    # 在宣告态下采样一致性，并验证新请求只进新副本
+    await c.post(GW + "/ops/replica/new/health?healthy=true")
+    await asyncio.sleep(0.4)
+    r = await c.post(GW + "/ops/switch")
+    assert r.status_code == 200, f"健康时应能切换: {r.text}"
+    r = await c.post(GW + "/ops/declare-complete")
+    assert r.status_code == 200, f"健康时应能宣告: {r.text}"
+    for _ in range(5):
+        s = await status(c)
+        assert s["declared_complete"] is True and s["active"] == "new", \
+            "宣告态下活动副本必须始终为 new"
+        assert s["safe_to_stop_old"] == (s["in_flight"]["old"] == 0), \
+            "停机结论必须与宣告/在途一致"
+        await asyncio.sleep(0.1)
+    rs = await asyncio.gather(*(c.get(GW + "/api/work?delay_ms=30") for _ in range(N2)))
+    assert all(r.status_code == 200 and r.json()["replica"] == "new" for r in rs), \
+        "宣告态下新请求应只进新副本"
+    await asyncio.sleep(0.5)
+
+    s = await status(c)
+    assert s["in_flight"] == {"old": 0, "new": 0}, f"结束后在途应为 0: {s['in_flight']}"
+    delta = {n: {k: s[k][n] - base[k][n] for k in ("admitted", "completed", "failed")} for n in ("old", "new")}
+    for n in ("old", "new"):
+        assert delta[n]["failed"] == 0, f"{n} 不应有上游错误"
+        assert delta[n]["admitted"] == delta[n]["completed"], f"{n} 受理必须等于完成: {delta[n]}"
+    total = delta["old"]["admitted"] + delta["new"]["admitted"]
+    assert total == N + N2, f"受理总数应等于发出的请求数 {N + N2}: {total}"
+
+    rold = (await c.get(OLD + "/state")).json()
+    rnew = (await c.get(NEW + "/state")).json()
+    assert rold["received"] - base_recv["old"] == delta["old"]["admitted"], "old 实收必须等于网关受理"
+    assert rnew["received"] - base_recv["new"] == delta["new"]["admitted"], "new 实收必须等于网关受理"
+    ids = []
+    for rep, n in ((rold, delta["old"]["admitted"]), (rnew, delta["new"]["admitted"])):
+        ids += rep["received_ids"][-n:] if n else []
+    assert len(ids) == N + N2 and len(set(ids)) == N + N2, "每个请求必须恰好送达一次（无重复无遗漏）"
+    print(f"    [info] 随机交错期间宣告曾成功={declared_seen}, generation={s['generation']}, "
+          f"old/new 各受理 {delta['old']['admitted']}/{delta['new']['admitted']}")
+
+
 SCENARIOS = [
     ("S1 初始路由到旧副本", s1_basic_routing),
     ("S2 新副本未就绪拒绝切换、旧副本继续接单", s2_switch_refused_when_new_down),
@@ -344,6 +545,8 @@ SCENARIOS = [
     ("S8 并发×健康抖动×切换交错下不重计不漏计", s8_concurrent_interleaving),
     ("S9 宣告完成门槛与幂等", s9_declare_gating),
     ("S10 处理器被取消时上游仍真正结束才扣减", s10_handler_cancelled_midflight),
+    ("S11 过期探活竞态：过期宣告被拒、恢复后须重新确认", s11_stale_probe_declare_rejected),
+    ("S12 并发×健康抖动×切换/宣告交错下状态一致、计数正确", s12_chaos_declare_consistency),
 ]
 
 
